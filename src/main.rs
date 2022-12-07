@@ -5,8 +5,8 @@ use std::{error::Error, thread, time::Duration, process, env, fs, cmp, fs::File}
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let M: f32 = 0.2;
-    let BASE_SPEED: f32 = 30.0;
+    let M: f32 = 0.05;
+    let BASE_SPEED: f32 = 42.0;
 
     let P: f32 = 2.0;
     let I: f32 = 0.028;
