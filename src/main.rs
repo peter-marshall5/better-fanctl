@@ -1,171 +1,220 @@
 use std::io::{Write, Seek, SeekFrom};
 use signal_hook::{consts::SIGINT, iterator::Signals};
-use std::{thread, time::Duration, process, env, fs};
-
-fn main() {
-    let _args: Vec<String> = env::args().collect();
-
-    static BASE_SPEED: f32 = 12.0;
-    static BASE_SPEED_FALLOFF_AC: f32 = 0.2;
-    static BASE_SPEED_FALLOFF_BAT: f32 = 0.4;
-
-    static ERROR_GAIN: f32 = 4.2;
-    static ACCUM_GAIN: f32 = 0.018;
-    static DERIVATIVE_GAIN: f32 = 0.995;
-
-    static ACCUM_MAX: f32 = 1000.0;
-    static ACCUM_MIN: f32 = -500.0;
-
-    static TEMP_SETPOINT: f32 = 72.0;
-    static LOW_TEMP: f32 = 45.0;
-
-    static MANUAL_ENABLE_ADDRESS: u16 = 21;
-    static SPEED_CONTROL_ADDRESS: u16 = 25;
-    static MAX_SPEED: u8 = 59;
-    static MIN_SPEED: u8 = 0;
-    static SPEED_DIFFERENCE: u8 = MAX_SPEED - MIN_SPEED;
-
-    static LOOP_INTERVAL_MS: u64 = 200;
-
-    static EC_PATH: &str = "/dev/ec";
-    static CPU_TEMP_PATH: &str = "/sys/class/hwmon/hwmon3/temp1_input";
-    static AC_PLUGGED_PATH: &str = "/sys/class/power_supply/ACAD/online";
-
-    let interval = Duration::from_millis(LOOP_INTERVAL_MS);
-
-    let mut speed;
-
-    let mut accumulation: f32 = 0.0;
-    let mut longterm_accumulation: f32 = 0.0;
-    let mut last_pid_output: f32 = 0.0;
-
-    let mut curr_tick: u8 = 0;
-
-    let mut battery_mode: bool = false;
+use std::{thread, time::Duration, env, fs, sync::Arc, sync::Mutex};
 
 
-    fn pct_to_speed(val: f32) -> u8 {
-        ((val / 100.0 * SPEED_DIFFERENCE as f32) as u32 - MIN_SPEED as u32) as u8
+struct FanSpeedController {
+    ec_path: String,
+    manual_enable_address: u16,
+    speed_control_address: u16,
+    min_speed: u8,
+    max_speed: u8,
+}
+
+impl FanSpeedController {
+    fn enable_manual_control(&self) {
+        self.write_ec(self.manual_enable_address, 1);
     }
 
-    //println!("{}", pct_to_speed(100.0));
-
-    fn enable_manual_control() {
-        write_ec(MANUAL_ENABLE_ADDRESS, 1);
+    fn disable_manual_control(&self) {
+        self.write_ec(self.manual_enable_address, 0);
     }
 
-    fn disable_manual_control() {
-        write_ec(MANUAL_ENABLE_ADDRESS, 0);
+    fn write_speed(&self, speed: f32) {
+        let raw_speed = ((speed / 100.0 * (self.max_speed - self.min_speed) as f32) as u32 - self.min_speed as u32) as u8;
+        self.write_ec(self.speed_control_address, raw_speed);
     }
 
-    fn read_temp() -> f32 {
-        let raw: i32 = fs::read_to_string(CPU_TEMP_PATH).unwrap().trim().parse().unwrap();
-        raw as f32 / 1000.0
-    }
-
-    fn write_speed(speed: u8) {
-        write_ec(SPEED_CONTROL_ADDRESS, speed);
-    }
-
-    fn write_ec(addr: u16, val: u8) {
+    fn write_ec(&self, addr: u16, val: u8) {
         let mut ec_file = fs::OpenOptions::new()
-          .write(true)
-          .create(false)
-          .open(EC_PATH)
-          .unwrap();
+            .write(true)
+            .create(false)
+            .open(&self.ec_path)
+            .unwrap();
 
         ec_file.seek(SeekFrom::Start(addr as u64)).unwrap();
         ec_file.write(&[val]).unwrap();
     }
+}
 
-    let mut signals = Signals::new(&[SIGINT]).unwrap();
+impl Drop for FanSpeedController {
+    fn drop(&mut self) {
+        self.disable_manual_control()
+    }
+}
 
-    thread::spawn(move || {
-        for _sig in signals.forever() {
-            // println!("Received signal {:?}", sig);
-            disable_manual_control();
-            process::exit(0);
-        }
-    });
 
-    enable_manual_control();
+struct TemperatureSensor {
+    hwmon_path: String,
+}
 
-    loop {
+impl TemperatureSensor {
+    fn read_temp(&self) -> f32 {
+        let raw: i32 = fs::read_to_string(&self.hwmon_path).unwrap().trim().parse().unwrap();
+        raw as f32 / 1000.0
+    }
+}
 
-        // Read the current CPU core temperature
-        let temp = read_temp();
 
-        let error = temp - TEMP_SETPOINT;
+struct PidController {
+    error_gain: f32,
+    accum_gain: f32,
+    deriv_gain: f32,
+    temp_setpoint: f32,
+    low_temp: f32,
+    accum_min: f32,
+    accum_max: f32,
+    base_speed: f32,
+    base_speed_falloff_ac: f32,
+    base_speed_falloff_bat: f32,
+    accumulation: f32,
+    longterm_accumulation: f32,
+    last_pid_output: f32,
+    battery_mode: bool,
+}
 
-        accumulation = accumulation + error;
-        if accumulation > ACCUM_MAX {
-            accumulation = ACCUM_MAX;
-        } else if accumulation < ACCUM_MIN {
-            accumulation = ACCUM_MIN;
+impl PidController {
+    fn tick(&mut self, temp: f32) -> f32 {
+        let error = temp - self.temp_setpoint;
+
+        self.accumulation = self.accumulation + error;
+        if self.accumulation > self.accum_max {
+            self.accumulation = self.accum_max;
+        } else if self.accumulation < self.accum_min {
+            self.accumulation = self.accum_min;
         }
 
         // Moving average of temperature
         // Tries to factor in the effects of the saturation of the cooling system
-        longterm_accumulation = {
-            if battery_mode {
+        self.longterm_accumulation = {
+            if self.battery_mode {
                 error
             } else {
-                if error > longterm_accumulation {
+                if error > self.longterm_accumulation {
                     error
                 } else {
-                    longterm_accumulation * 0.99 + error * 0.01
+                    self.longterm_accumulation * 0.99 + error * 0.01
                 }
             }
         };
 
         let pi_output = {
-            if temp > TEMP_SETPOINT {
-                error * ERROR_GAIN + accumulation * ACCUM_GAIN
+            if temp > self.temp_setpoint {
+                error * self.error_gain + self.accumulation * self.accum_gain
             } else {
                 0.0
             }
         };
 
-        let derivative = last_pid_output - pi_output;
+        let derivative = self.last_pid_output - pi_output;
 
         let speed_offset = {
-            if temp <= LOW_TEMP && battery_mode {
+            if temp <= self.low_temp && self.battery_mode {
                 0.00
-            } else if temp <= TEMP_SETPOINT {
-                if battery_mode {
-                    BASE_SPEED + (longterm_accumulation * BASE_SPEED_FALLOFF_BAT)
+            } else if temp <= self.temp_setpoint {
+                if self.battery_mode {
+                    self.base_speed + (self.longterm_accumulation * self.base_speed_falloff_bat)
                 } else {
-                    BASE_SPEED + (longterm_accumulation * BASE_SPEED_FALLOFF_AC)
+                    self.base_speed + (self.longterm_accumulation * self.base_speed_falloff_ac)
                 }
             } else {
-                BASE_SPEED
+                self.base_speed
             }
         };
 
-        let pid_output = pi_output + derivative * DERIVATIVE_GAIN;
-        last_pid_output = pid_output;
-        let final_output = pid_output + speed_offset;
+        let pid_output = pi_output + derivative * self.deriv_gain;
+        self.last_pid_output = pid_output;
 
-        speed = {
+        pid_output + speed_offset
+    }
+}
+
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    static LOOP_INTERVAL_MS: u64 = 200;
+
+    let interval = Duration::from_millis(LOOP_INTERVAL_MS);
+
+    let mut curr_tick: u8 = 0;
+
+    let main_fan = FanSpeedController {
+        ec_path: args[2].clone(),
+        manual_enable_address: 21,
+        speed_control_address: 25,
+        min_speed: 0,
+        max_speed: 59,
+    };
+
+    let cpu_thermal = TemperatureSensor {
+        hwmon_path: args[1].clone(),
+    };
+
+    let mut pid_controller = PidController {
+        error_gain: 4.2,
+        accum_gain: 0.018,
+        deriv_gain: 0.995,
+        temp_setpoint: 72.0,
+        low_temp: 45.0,
+        base_speed: 12.0,
+        base_speed_falloff_ac: 0.2,
+        base_speed_falloff_bat: 0.4,
+        accum_min: 1000.0,
+        accum_max: -500.0,
+        accumulation: 0.0,
+        longterm_accumulation: 0.0,
+        last_pid_output: 0.0,
+        battery_mode: false,
+    };
+
+    let ac_plugged_path: &str = &args[3].clone();
+
+    let stop_signal = Arc::new(Mutex::new(false));
+    let cloned_signal = Arc::clone(&stop_signal);
+
+    let mut signals = Signals::new(&[SIGINT]).unwrap();
+
+    thread::spawn(move || {
+        for _sig in signals.forever() {
+            let mut state = cloned_signal.lock().unwrap();
+            *state = true;
+        }
+    });
+
+    let _ = cpu_thermal.read_temp();
+    main_fan.enable_manual_control();
+
+    loop {
+        if *stop_signal.lock().unwrap() {
+            main_fan.disable_manual_control();
+            break;
+        }
+
+        // Read the current CPU core temperature
+        let temp = cpu_thermal.read_temp();
+
+        let final_output = pid_controller.tick(temp);
+
+        //println!("{}", final_output);
+
+        let final_speed = {
             if final_output >= 100.0 {
-                MAX_SPEED
+                100.
             } else if final_output <= 0.0 {
-                0
+                0.0
             } else {
-                pct_to_speed(final_output)
+                final_output
             }
         };
 
-        // Output for tuning the PID gains
-        //println!("S:{speed} T:{temp} E:{error} A:{accumulation} D:{derivative} O1:{pi_output} O2:{pid_output}");
-
-        write_speed(speed);
+        main_fan.write_speed(final_speed); 
 
         curr_tick += 1;
 
         if curr_tick > 20 {
-            enable_manual_control();
-            battery_mode = fs::read_to_string(AC_PLUGGED_PATH).unwrap().trim() == "0";
+            main_fan.enable_manual_control();
+            pid_controller.battery_mode = fs::read_to_string(ac_plugged_path).unwrap().trim() == "0";
             curr_tick = 0;
         }
 
