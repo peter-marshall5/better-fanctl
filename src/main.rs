@@ -200,7 +200,7 @@ fn main() {
 
         let final_speed = {
             if final_output >= 100.0 {
-                100.
+                100.0
             } else if final_output <= 0.0 {
                 0.0
             } else {
