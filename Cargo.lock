@@ -3,6 +3,13 @@
 version = 3
 
 [[package]]
+name = "better-fanctl"
+version = "0.1.0"
+dependencies = [
+ "signal-hook",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.138"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -25,11 +32,4 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e51e73328dc4ac0c7ccbda3a494dfa03df1de2f46018127f60c693f2648455b0"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "smartfan4"
-version = "0.1.0"
-dependencies = [
- "signal-hook",
 ]

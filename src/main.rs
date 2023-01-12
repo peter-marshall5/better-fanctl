@@ -1,22 +1,22 @@
 use std::io::{Write, Seek, SeekFrom};
 use signal_hook::{consts::SIGINT, iterator::Signals};
-use std::{thread, time::Duration, process, env, fs, fs::File};
+use std::{thread, time::Duration, process, env, fs};
 
 fn main() {
     let _args: Vec<String> = env::args().collect();
 
-    static BASE_SPEED: f32 = 36.0;
+    static BASE_SPEED: f32 = 12.0;
     static BASE_SPEED_FALLOFF_AC: f32 = 0.2;
     static BASE_SPEED_FALLOFF_BAT: f32 = 0.4;
 
-    static ERROR_GAIN: f32 = 2.0;
-    static ACCUM_GAIN: f32 = 0.028;
-    static DERIVATIVE_GAIN: f32 = 0.98;
+    static ERROR_GAIN: f32 = 4.2;
+    static ACCUM_GAIN: f32 = 0.018;
+    static DERIVATIVE_GAIN: f32 = 0.995;
 
     static ACCUM_MAX: f32 = 1000.0;
     static ACCUM_MIN: f32 = -500.0;
 
-    static TEMP_SETPOINT: f32 = 78.0;
+    static TEMP_SETPOINT: f32 = 72.0;
     static LOW_TEMP: f32 = 45.0;
 
     static MANUAL_ENABLE_ADDRESS: u16 = 21;
@@ -44,9 +44,11 @@ fn main() {
     let mut battery_mode: bool = false;
 
 
-    fn pct_to_speed(val: u8) -> u8 {
-        (val as u32 * SPEED_DIFFERENCE as u32 / 255 - MIN_SPEED as u32) as u8
+    fn pct_to_speed(val: f32) -> u8 {
+        ((val / 100.0 * SPEED_DIFFERENCE as f32) as u32 - MIN_SPEED as u32) as u8
     }
+
+    //println!("{}", pct_to_speed(100.0));
 
     fn enable_manual_control() {
         write_ec(MANUAL_ENABLE_ADDRESS, 1);
@@ -66,7 +68,11 @@ fn main() {
     }
 
     fn write_ec(addr: u16, val: u8) {
-        let mut ec_file = File::create(EC_PATH).unwrap();
+        let mut ec_file = fs::OpenOptions::new()
+          .write(true)
+          .create(false)
+          .open(EC_PATH)
+          .unwrap();
 
         ec_file.seek(SeekFrom::Start(addr as u64)).unwrap();
         ec_file.write(&[val]).unwrap();
@@ -142,16 +148,16 @@ fn main() {
 
         speed = {
             if final_output >= 100.0 {
-                255
+                MAX_SPEED
             } else if final_output <= 0.0 {
                 0
             } else {
-                pct_to_speed((final_output * 255.0 / 100.0) as u8)
+                pct_to_speed(final_output)
             }
         };
 
         // Output for tuning the PID gains
-        // println!("S:{speed} T:{temp} E:{error} A:{accumulation} D:{derivative} OF:{speed_offset} O1:{pi_output} O2:{pid_output} L:{longterm_accumulation}");
+        //println!("S:{speed} T:{temp} E:{error} A:{accumulation} D:{derivative} O1:{pi_output} O2:{pid_output}");
 
         write_speed(speed);
 
